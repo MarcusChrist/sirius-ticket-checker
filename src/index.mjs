@@ -601,7 +601,14 @@ async function sendSlack(title, body) {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // Cron containers must fully terminate. npm-wrapped starts and open
+    // fetch keep-alives can leave the process Active on Railway, which
+    // blocks/fails the next scheduled run about 15 minutes later.
+    process.exit(0);
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
