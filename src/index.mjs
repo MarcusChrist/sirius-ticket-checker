@@ -1,5 +1,6 @@
 import "dotenv/config";
 import dns from "node:dns";
+import { Agent, fetch as undiciFetch } from "undici";
 import * as cheerio from "cheerio";
 import { dirname } from "node:path";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -34,6 +35,13 @@ const HEALTH_ALERT_AFTER_FAILURES = Number(
 );
 const NOTIFY_TIMEOUT_MS = Number(process.env.NOTIFY_TIMEOUT_MS || "20000");
 const NOTIFY_RETRIES = Number(process.env.NOTIFY_RETRIES || "3");
+
+const outboundAgent = new Agent({
+  connect: {
+    family: 4,
+    timeout: NOTIFY_TIMEOUT_MS,
+  },
+});
 
 async function main() {
   const { events, sourceStats } = await fetchEvents();
@@ -593,15 +601,33 @@ async function fetchWithTimeout(url, options, timeoutMs = NOTIFY_TIMEOUT_MS) {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await undiciFetch(url, {
+      ...options,
+      signal: controller.signal,
+      dispatcher: outboundAgent,
+    });
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error(`request timed out after ${timeoutMs}ms`);
     }
-    throw error;
+    throw new Error(formatFetchError(error));
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function formatFetchError(error) {
+  const cause = error.cause;
+  if (cause instanceof AggregateError) {
+    const details = cause.errors
+      .map((entry) => entry.code || entry.message)
+      .join(", ");
+    return `${error.message} (${details})`;
+  }
+  if (cause?.code || cause?.message) {
+    return `${error.message} (${cause.code || cause.message})`;
+  }
+  return error.message;
 }
 
 async function withRetries(label, fn, retries = NOTIFY_RETRIES) {
@@ -627,22 +653,38 @@ async function withRetries(label, fn, retries = NOTIFY_RETRIES) {
 
 async function sendNtfy(title, body) {
   await withRetries("ntfy", async () => {
-    const response = await fetchWithTimeout(
-      `${NTFY_SERVER}/${encodeURIComponent(NTFY_TOPIC)}`,
-      {
-        method: "POST",
-        headers: {
-          Title: title,
-          Priority: "5",
-          Tags: "soccer,ticket",
-        },
-        body,
-      },
-    );
+    const servers =
+      NTFY_SERVER === "https://ntfy.sh"
+        ? ["https://ntfy.sh", "http://ntfy.sh"]
+        : [NTFY_SERVER];
+    let lastError;
 
-    if (!response.ok) {
-      throw new Error(`ntfy returned HTTP ${response.status}`);
+    for (const server of servers) {
+      try {
+        const response = await fetchWithTimeout(
+          `${server}/${encodeURIComponent(NTFY_TOPIC)}`,
+          {
+            method: "POST",
+            headers: {
+              Title: title,
+              Priority: "5",
+              Tags: "soccer,ticket",
+            },
+            body,
+          },
+        );
+
+        if (!response.ok) {
+          throw new Error(`ntfy returned HTTP ${response.status}`);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        console.warn(`ntfy via ${server} failed: ${error.message}`);
+      }
     }
+
+    throw lastError;
   });
 }
 
