@@ -1,6 +1,9 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "npm start"
+    "startCommand": "node src/index.mjs",
+    "cronSchedule": "*/15 * * * *",
+    "restartPolicyType": "NEVER",
+    "healthcheckPath": null
   }
 }
