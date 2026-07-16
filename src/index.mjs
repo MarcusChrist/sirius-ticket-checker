@@ -27,6 +27,8 @@ const SEARCH_TERMS = (process.env.SEARCH_TERMS || "biljettsläpp,biljetter,bilje
 const HEALTH_ALERT_AFTER_FAILURES = Number(
   process.env.HEALTH_ALERT_AFTER_FAILURES || "3",
 );
+const NOTIFY_TIMEOUT_MS = Number(process.env.NOTIFY_TIMEOUT_MS || "20000");
+const NOTIFY_RETRIES = Number(process.env.NOTIFY_RETRIES || "3");
 
 async function main() {
   const { events, sourceStats } = await fetchEvents();
@@ -93,8 +95,16 @@ async function main() {
   let notified = false;
 
   if (newEvents.length > 0 && (!isFirstRun || NOTIFY_ON_FIRST_RUN)) {
-    await notify(newEvents);
-    notified = true;
+    try {
+      await notify(newEvents);
+      notified = true;
+    } catch (error) {
+      console.warn(
+        `Failed to send notifications for ${newEvents.length} new signal(s): ${error.message}. ` +
+          "State will not be updated; the next run will retry.",
+      );
+      return;
+    }
   } else if (newEvents.length > 0 && isFirstRun && !NOTIFY_ON_FIRST_RUN) {
     console.log(
       "First run: creating baseline without notifications. Set NOTIFY_ON_FIRST_RUN=true to notify on first run.",
@@ -516,10 +526,15 @@ async function maybeNotifyHealthIssue(state, consecutiveSourceFailures, failedSo
     .map((source) => `${source.name}: ${source.error}`)
     .join("\n");
 
-  await notifyMessage(
-    "Sirius ticket watcher: sources failing",
-    `No sources succeeded for ${consecutiveSourceFailures} consecutive runs.\n\n${details}\n\nTicket releases may be missed until this is fixed.`,
-  );
+  try {
+    await notifyMessage(
+      "Sirius ticket watcher: sources failing",
+      `No sources succeeded for ${consecutiveSourceFailures} consecutive runs.\n\n${details}\n\nTicket releases may be missed until this is fixed.`,
+    );
+  } catch (error) {
+    console.warn(`Health alert notification failed: ${error.message}`);
+    return;
+  }
 
   const latest = await loadState();
   await saveState({
@@ -568,37 +583,78 @@ async function notifyMessage(title, body) {
   await Promise.all(tasks);
 }
 
-async function sendNtfy(title, body) {
-  const response = await fetch(
-    `${NTFY_SERVER}/${encodeURIComponent(NTFY_TOPIC)}`,
-    {
-      method: "POST",
-      headers: {
-        Title: title,
-        Priority: "5",
-        Tags: "soccer,ticket",
-      },
-      body,
-    },
-  );
+async function fetchWithTimeout(url, options, timeoutMs = NOTIFY_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    throw new Error(`ntfy returned HTTP ${response.status}`);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-async function sendSlack(title, body) {
-  const response = await fetch(SLACK_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      text: `*${title}*\n${body}`,
-    }),
-  });
+async function withRetries(label, fn, retries = NOTIFY_RETRIES) {
+  let lastError;
 
-  if (!response.ok) {
-    throw new Error(`Slack returned HTTP ${response.status}`);
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        const delayMs = attempt * 1000;
+        console.warn(
+          `${label} attempt ${attempt}/${retries} failed: ${error.message}. Retrying in ${delayMs}ms...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
   }
+
+  throw lastError;
+}
+
+async function sendNtfy(title, body) {
+  await withRetries("ntfy", async () => {
+    const response = await fetchWithTimeout(
+      `${NTFY_SERVER}/${encodeURIComponent(NTFY_TOPIC)}`,
+      {
+        method: "POST",
+        headers: {
+          Title: title,
+          Priority: "5",
+          Tags: "soccer,ticket",
+        },
+        body,
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`ntfy returned HTTP ${response.status}`);
+    }
+  });
+}
+
+async function sendSlack(title, body) {
+  await withRetries("Slack", async () => {
+    const response = await fetchWithTimeout(SLACK_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text: `*${title}*\n${body}`,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Slack returned HTTP ${response.status}`);
+    }
+  });
 }
 
 main().catch((error) => {
