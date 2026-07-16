@@ -35,14 +35,16 @@ Without `NTFY_TOPIC` or `SLACK_WEBHOOK_URL`, the job will **refuse to mark new s
 2. Create a new Railway service from the repo.
 3. Add a **persistent volume mounted at `/data`**. Without this, every cron run looks like a first run and you will never get notified.
 4. Add the variables above. `STATE_FILE` must point at the volume (`/data/seen-events.json`).
-5. Configure the service as a cron job.
-6. Cron expression for every 15 minutes:
+5. Deploy settings come from `railway.json` (cron every 15 minutes, `node src/index.mjs`, restart policy `NEVER`).
+6. Do **not** use `npm start` as the start command. On Railway, npm stays as PID 1 and the container can remain `Active` after the check finishes, which makes the next cron tick fail about 15 minutes later.
+
+Cron expression (also set in `railway.json`):
 
 ```cron
 */15 * * * *
 ```
 
-The process should run, check the sources, save state, and exit.
+The process should run, check the sources, save state, and exit with code 0.
 
 ## How detection works
 
@@ -80,5 +82,6 @@ Check Railway logs for:
 - `All sources failed`
 - `No notification channel configured`
 - missing volume / `STATE_FILE` resets between runs
+- deployments that go `success` → `failure` every other 15-minute tick (container did not exit; confirm start command is `node src/index.mjs` and restart policy is `NEVER`)
 
 Inspect `/data/seen-events.json` on the volume: `baselineEstablished`, `lastCheckedAt`, and whether the missing article URL is already in `seenKeys`.
