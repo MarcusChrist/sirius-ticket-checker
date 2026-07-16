@@ -1,7 +1,12 @@
 import "dotenv/config";
+import dns from "node:dns";
 import * as cheerio from "cheerio";
 import { dirname } from "node:path";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+
+// Railway egress often lacks working IPv6; ntfy.sh advertises AAAA records and
+// Node's default "verbatim" order can hang on connect before falling back.
+dns.setDefaultResultOrder("ipv4first");
 
 const EVENTS_URL =
   process.env.EVENTS_URL || "https://siriusfotboll.ebiljett.nu/List/Events";
